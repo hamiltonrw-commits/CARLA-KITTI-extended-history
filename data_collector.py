@@ -283,18 +283,33 @@ class CarlaGame(object):
         self.world = World(client.get_world(), self.hud, args)
 
         self.controller = KeyboardControl(self.world)
-        if (args.autopilot == False):
-            self.agent = BehaviorAgent(self.world.player)
+        self.agent = None
+        self.spawn_points = []
+        self._configure_agent(args)
 
-            self.spawn_points = self.world.map.get_spawn_points()
-            random.shuffle(self.spawn_points)
+    def _configure_agent(self, args):
+        if args.autopilot:
+            return
 
-            if self.spawn_points[0].location != self.agent.vehicle.get_location():
-                destination = self.spawn_points[0].location
-            else:
-                destination = self.spawn_points[1].location
+        self.agent = BehaviorAgent(self.world.player)
+        self.spawn_points = self.world.map.get_spawn_points()
+        random.shuffle(self.spawn_points)
 
-            self.agent.set_destination(self.agent.vehicle.get_location(), destination, clean=True)
+        if len(self.spawn_points) < 2:
+            raise RuntimeError('At least two vehicle spawn points are required to route the behavior agent.')
+
+        if self.spawn_points[0].location != self.agent.vehicle.get_location():
+            destination = self.spawn_points[0].location
+        else:
+            destination = self.spawn_points[1].location
+
+        self.agent.set_destination(self.agent.vehicle.get_location(), destination, clean=True)
+
+    def _sync_agent_with_world(self, args):
+        if args.autopilot:
+            return
+        if self.agent is None or not self.agent.vehicle.is_alive or self.agent.vehicle.id != self.world.player.id:
+            self._configure_agent(args)
 
     def current_captured_frame_num(self, args):
         # Figures out which frame number we currently are on
@@ -490,13 +505,20 @@ class CarlaGame(object):
 
         # Stores all datapoints for the current frames
         for agent in agents_list:
-            image, kitti_datapoint, bounding_box = create_kitti_datapoint(agent=agent,
-                                                                          camera=self.world.camera_manager.sensors['sensor.camera.rgb']['sensor'],
-                                                                          cam_calibration=self.world.camera_manager.sensors['sensor.camera.rgb']['calibration'],
-                                                                          image=image,
-                                                                          depth_map=depth_map,
-                                                                          player_transform=self.world.player.get_transform(),
-                                                                          max_render_depth=args.lidar_range)
+            if not agent.is_alive:
+                continue
+            try:
+                image, kitti_datapoint, bounding_box = create_kitti_datapoint(agent=agent,
+                                                                              camera=self.world.camera_manager.sensors['sensor.camera.rgb']['sensor'],
+                                                                              cam_calibration=self.world.camera_manager.sensors['sensor.camera.rgb']['calibration'],
+                                                                              image=image,
+                                                                              depth_map=depth_map,
+                                                                              player_transform=self.world.player.get_transform(),
+                                                                              max_render_depth=args.lidar_range)
+            except RuntimeError as err:
+                logging.debug('Skipping actor %s because it became invalid while generating labels: %s',
+                              getattr(agent, 'id', '<unknown>'), err)
+                continue
             if kitti_datapoint:
                 datapoints.append(kitti_datapoint)
                 bounding_boxes.append(bounding_box)
@@ -562,95 +584,107 @@ class CarlaGame(object):
     def game_loop(self, args):
         """ Main loop for agent"""
 
-        sensors = [val['sensor'] for val in self.world.camera_manager.sensors.values()]
-        # Create a synchronous mode context.
-        with CarlaSyncMode(self.world.world, *sensors, fps=args.fps) as sync_mode:
-            while True:
-                if self.controller.parse_events():
-                    return
-                self._timer.tick()
-                self.clock.tick()
+        while True:
+            sensors = [val['sensor'] for val in self.world.camera_manager.sensors.values()]
+            sensor_ids = [sensor.id for sensor in sensors]
+            player_id = self.world.player.id
+            # Create a synchronous mode context.
+            with CarlaSyncMode(self.world.world, *sensors, fps=args.fps) as sync_mode:
+                while True:
+                    if self.controller.parse_events():
+                        return
 
-                # Advance the simulation and wait for the data.
-                # Assume that the sensor data have the same order as in self.world.camera_manager.sensors
-                simulation_data = sync_mode.tick(timeout=2.0)
-                assert len(simulation_data) == len(self.world.camera_manager.sensors.keys()) + 1  # +1 for snapshot data
-
-                world_snapshot = simulation_data[0]  # maybe be used in future
-
-                sensors_data_dict = dict()
-                for i, key in enumerate(self.world.camera_manager.sensors.keys()):
-                    sensors_data_dict.update({key: simulation_data[i+1]})
-
-                # Reset the environment if the agent is stuck or can't find any agents or
-                # if we have captured enough frames in this one
-                is_stuck = self._frames_since_last_capture >= args.num_empty_frames_before_reset
-                is_enough_datapoints = (self._captured_frames_since_restart + 1) % args.num_recordings_before_reset == 0
-
-                if (is_stuck or is_enough_datapoints) and args.save_data:
-                    if is_stuck:
-                        logging.warning("The agent is either stuck or can't find any agents!")
-                    if is_enough_datapoints:
-                        logging.info("Enough datapoints captured. The episode is going to restart.")
-                    self._on_new_episode(args)
-                    # If we dont sleep, the client will continue to render
-                    self.reset_episode = True
-                    continue
-
-                if (args.autopilot == False):
-                    self.agent.update_information(self.world)
-
-                # Tick HUD
-                self.world.tick(self.clock)
-
-                processed_sensor_data = self._preprocess_sensor_data(sensors_data_dict)
-
-                # Rendering sensor images and creating KITTI datapoints for each frame
-                # TODO makes sense to have on_render only dealing with rendering not datapoint generation.
-                datapoints = self._render(self.display, processed_sensor_data, args)
-
-                # Rendering HUD
-                self.world.render(self.display)
-                pygame.display.flip()
-
-                if args.save_data:
-
-                    point_clouds = []
-                    lidar_heights = []
-                    lidar_cam_mats = []
-                    for key in processed_sensor_data.keys():
-                        if 'lidar' in key:
-                            point_cloud = processed_sensor_data[key]['points']
-                            lidar_height = self.world.camera_manager.sensors[key]['transform'].location.z
-                            lidar_cam_mat = self.world.camera_manager.sensors[key]['lidar_cam_mat']
-                            point_clouds.append(point_cloud)
-                            lidar_heights.append(lidar_height)
-                            lidar_cam_mats.append(lidar_cam_mat)
-
-                    rgb_image = processed_sensor_data['sensor.camera.rgb']['image']
-                    self._save_datapoints(datapoints,
-                                          self.world.camera_manager.sensors['sensor.camera.rgb']['calibration'],
-                                          rgb_image,
-                                          point_clouds,
-                                          lidar_heights, lidar_cam_mats, args)
-
-                if (args.autopilot == False):
-                    # Set new destination when target has been reached
-                    if len(self.agent.get_local_planner()._waypoints_queue) < self.num_min_waypoints and args.loop:
-                        self.agent.reroute(self.spawn_points)
-                        self.tot_target_reached += 1
-                        self.world.hud.notification("The target has been reached " +
-                                               str(self.tot_target_reached) + " times.", seconds=4.0)
-
-                    elif len(self.agent.get_local_planner()._waypoints_queue) == 0 and not args.loop:
-                        print("Target reached, mission accomplished...")
+                    current_sensors = [val['sensor'] for val in self.world.camera_manager.sensors.values()]
+                    current_sensor_ids = [sensor.id for sensor in current_sensors]
+                    if self.world.player.id != player_id or current_sensor_ids != sensor_ids:
+                        self._sync_agent_with_world(args)
                         break
 
-                    speed_limit = self.world.player.get_speed_limit()
-                    self.agent.get_local_planner().set_speed(speed_limit)
+                    self._timer.tick()
+                    self.clock.tick()
 
-                    control = self.agent.run_step()
-                    self.world.player.apply_control(control)
+                    # Advance the simulation and wait for the data.
+                    # Assume that the sensor data have the same order as in self.world.camera_manager.sensors
+                    simulation_data = sync_mode.tick(timeout=2.0)
+                    assert len(simulation_data) == len(self.world.camera_manager.sensors.keys()) + 1  # +1 for snapshot data
+
+                    world_snapshot = simulation_data[0]  # maybe be used in future
+
+                    sensors_data_dict = dict()
+                    for i, key in enumerate(self.world.camera_manager.sensors.keys()):
+                        sensors_data_dict.update({key: simulation_data[i+1]})
+
+                    # Reset the environment if the agent is stuck or can't find any agents or
+                    # if we have captured enough frames in this one
+                    is_stuck = self._frames_since_last_capture >= args.num_empty_frames_before_reset
+                    is_enough_datapoints = (self._captured_frames_since_restart + 1) % args.num_recordings_before_reset == 0
+
+                    if (is_stuck or is_enough_datapoints) and args.save_data:
+                        if is_stuck:
+                            logging.warning("The agent is either stuck or can't find any agents!")
+                        if is_enough_datapoints:
+                            logging.info("Enough datapoints captured. The episode is going to restart.")
+                        self._on_new_episode(args)
+                        # If we dont sleep, the client will continue to render
+                        self.reset_episode = True
+                        continue
+
+                    self._sync_agent_with_world(args)
+                    if (args.autopilot == False):
+                        self.agent.update_information(self.world)
+
+                    # Tick HUD
+                    self.world.tick(self.clock)
+
+                    processed_sensor_data = self._preprocess_sensor_data(sensors_data_dict)
+
+                    # Rendering sensor images and creating KITTI datapoints for each frame
+                    # TODO makes sense to have on_render only dealing with rendering not datapoint generation.
+                    datapoints = self._render(self.display, processed_sensor_data, args)
+
+                    # Rendering HUD
+                    self.world.render(self.display)
+                    pygame.display.flip()
+
+                    if args.save_data:
+
+                        point_clouds = []
+                        lidar_heights = []
+                        lidar_cam_mats = []
+                        for key in processed_sensor_data.keys():
+                            if 'lidar' in key:
+                                point_cloud = processed_sensor_data[key]['points']
+                                lidar_height = self.world.camera_manager.sensors[key]['transform'].location.z
+                                lidar_cam_mat = self.world.camera_manager.sensors[key]['lidar_cam_mat']
+                                point_clouds.append(point_cloud)
+                                lidar_heights.append(lidar_height)
+                                lidar_cam_mats.append(lidar_cam_mat)
+
+                        rgb_image = processed_sensor_data['sensor.camera.rgb']['image']
+                        self._save_datapoints(datapoints,
+                                              self.world.camera_manager.sensors['sensor.camera.rgb']['calibration'],
+                                              rgb_image,
+                                              point_clouds,
+                                              lidar_heights, lidar_cam_mats, args)
+
+                    if (args.autopilot == False):
+                        # Set new destination when target has been reached
+                        if len(self.agent.get_local_planner()._waypoints_queue) < self.num_min_waypoints and args.loop:
+                            self.agent.reroute(self.spawn_points)
+                            self.tot_target_reached += 1
+                            self.world.hud.notification("The target has been reached " +
+                                                   str(self.tot_target_reached) + " times.", seconds=4.0)
+
+                        elif len(self.agent.get_local_planner()._waypoints_queue) == 0 and not args.loop:
+                            print("Target reached, mission accomplished...")
+                            return
+
+                        speed_limit = self.world.player.get_speed_limit()
+                        self.agent.get_local_planner().set_speed(speed_limit)
+
+                        control = self.agent.run_step()
+                        self.world.player.apply_control(control)
+                continue
 
 def main():
     """Main method"""
